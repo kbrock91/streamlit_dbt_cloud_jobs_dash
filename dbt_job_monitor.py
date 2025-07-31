@@ -155,7 +155,7 @@ def get_all_environments():
 
 # --- Function to fetch job runs for a specific day ---
 # Renamed and modified to take a date argument
-@st.cache_data(ttl=600) # Cache results for 10 minutes
+@st.cache_data(ttl=60) # Cache results for 1 minute (to catch recent runs faster)
 def get_runs_for_day(target_date: date, limit_per_page=100, max_pages_to_check=20):
     """Retrieves dbt Cloud job runs created on target_date (UTC), filtering client-side.
 
@@ -226,6 +226,140 @@ def get_runs_for_day(target_date: date, limit_per_page=100, max_pages_to_check=2
     st.write(f"Total runs found for {target_date.isoformat()} (after client-side filtering): {len(all_runs_today)}")
     return all_runs_today
 
+# --- Function to calculate rolling 7-day averages and flags ---
+def calculate_rolling_averages_and_flags(df):
+    """Calculate rolling 7-day averages and flag jobs exceeding average runtime.
+    
+    Args:
+        df (pd.DataFrame): DataFrame with run data
+        
+    Returns:
+        pd.DataFrame: DataFrame with added columns for averages and flags
+    """
+    # Helper function to calculate duration from timestamps only (as decided)
+    debug_count = 0
+    def calculate_duration_from_timestamps(started_at_str, finished_at_str=None):
+        """Calculate duration in seconds using only timestamps for consistency and real-time accuracy"""
+        nonlocal debug_count
+        
+        if not started_at_str or pd.isna(started_at_str):
+            return None
+            
+        try:
+            # Parse start time with proper timezone handling
+            start_time = pd.to_datetime(started_at_str)
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=timezone.utc)
+            
+            # Debug removed - issue identified and fixed
+            
+            if finished_at_str and pd.notna(finished_at_str):
+                # Completed run (Success/Error/Cancelled): use actual finish time
+                end_time = pd.to_datetime(finished_at_str)
+                if end_time.tzinfo is None:
+                    end_time = end_time.replace(tzinfo=timezone.utc)
+                duration = (end_time - start_time).total_seconds()
+                debug_count += 1
+                return duration
+            else:
+                # In-progress run (Queued/Starting/Running): use current time for real-time elapsed duration
+                now = datetime.now(timezone.utc)
+                duration = (now - start_time).total_seconds()
+                debug_count += 1
+                return duration
+                
+        except (ValueError, TypeError) as e:
+            return None
+    
+    if df.empty:
+        return df
+    
+    # Debug: Removed - issue identified and fixed
+    
+    # Get the date range for the past 7 days from the latest run
+    latest_date = df['created_at'].max().date()
+    seven_days_ago = latest_date - timedelta(days=7)
+    
+    # Fetch runs from the past 7 days for average calculation
+    st.write(f"Fetching rolling 7-day data ({seven_days_ago} to {latest_date}) for average calculations...")
+    
+    rolling_runs = []
+    for days_back in range(8):  # Get 8 days to ensure we have enough data
+        fetch_date = latest_date - timedelta(days=days_back)
+        if fetch_date < seven_days_ago:
+            continue
+        daily_runs = get_runs_for_day(fetch_date)
+        if daily_runs:
+            rolling_runs.extend(daily_runs)
+    
+
+    if not rolling_runs:
+        st.warning("No historical data found for rolling average calculation.")
+        # Add empty columns and calculate current durations from timestamps
+        df['7d_avg_duration'] = None
+        # Calculate run duration from timestamps for display
+        df['run_duration_seconds'] = df.apply(
+            lambda row: calculate_duration_from_timestamps(
+                row.get('started_at') or row.get('created_at'), 
+                row.get('finished_at')
+            ), axis=1
+        )
+        df['exceeds_average'] = False
+        return df
+    
+    # Create DataFrame for rolling calculations
+    rolling_df = pd.DataFrame(rolling_runs)
+    rolling_df['created_at'] = pd.to_datetime(rolling_df['created_at'])
+    
+    # Filter to completed runs only for average calculation 
+    # Completed: 10 = Success, 20 = Error, 30 = Cancelled
+    # In-progress: 1 = Queued, 2 = Starting, 3 = Running
+    completed_rolling = rolling_df[rolling_df['status'].isin([10, 20, 30])].copy()
+    
+    # Calculate duration from timestamps for averaging
+    completed_rolling['duration_seconds'] = completed_rolling.apply(
+        lambda row: calculate_duration_from_timestamps(
+            row.get('started_at') or row.get('created_at'), 
+            row.get('finished_at')
+        ), axis=1
+    )
+    
+    # Remove rows where duration couldn't be calculated
+    completed_rolling = completed_rolling[completed_rolling['duration_seconds'].notna()]
+    
+    # Calculate 7-day averages per job (in seconds)
+    job_averages = completed_rolling.groupby('job_definition_id')['duration_seconds'].mean().to_dict()
+    
+    # Add 7-day average column
+    df['7d_avg_duration'] = df['job_definition_id'].map(job_averages)
+    
+    # Calculate current/elapsed duration for each run
+    current_durations = []
+    exceeds_flags = []
+    
+    for _, row in df.iterrows():
+        job_avg = row['7d_avg_duration']
+        
+        # Calculate actual duration from timestamps (completed jobs use finished_at, in-progress use current time)
+        started_at = row.get('started_at') or row.get('created_at')
+        finished_at = row.get('finished_at')
+        current_duration = calculate_duration_from_timestamps(started_at, finished_at)
+        
+        current_durations.append(current_duration)
+        
+        # Check if it exceeds average (only if we have valid durations)
+        if (pd.notna(job_avg) and current_duration is not None and 
+            current_duration > job_avg):
+            exceeds_flags.append(True)
+        else:
+            exceeds_flags.append(False)
+    
+    # Store the calculated duration for display (timestamp-based calculation)
+    df['run_duration_seconds'] = current_durations
+    df['exceeds_average'] = exceeds_flags
+    
+    return df
+
 # --- Streamlit App UI ---
 st.set_page_config(layout="wide", page_title="dbt Cloud Run Monitor")
 st.title("dbt Cloud Job Run Monitor")
@@ -262,6 +396,12 @@ with col1:
     # Initialize session state for dataframe if it doesn't exist
     if 'runs_df' not in st.session_state:
         st.session_state['runs_df'] = pd.DataFrame()
+
+    # Add cache clear button for recent runs
+    if st.button("🔄 Clear Cache & Refresh", help="Clear cache to fetch the most recent runs"):
+        st.cache_data.clear()
+        st.session_state['runs_df'] = pd.DataFrame()
+        st.rerun()
 
     if st.button("Fetch Runs", type="primary"):
         # Clear previous results before fetching new ones
@@ -325,7 +465,15 @@ with col1:
                        for job in all_jobs}
             project_map = {proj['id']: proj.get('name', f"Project {proj['id']}") for proj in all_projects}
             environment_map = {env['id']: env.get('name', f"Env {env['id']}") for env in all_environments}
-            status_map = { 10: "Success", 20: "Error", 30: "Cancelled" }
+            # Complete status mapping for dbt Cloud jobs
+            status_map = { 
+                1: "Queued", 
+                2: "Starting",
+                3: "Running", 
+                10: "Success", 
+                20: "Error", 
+                30: "Cancelled" 
+            }
 
             # 4. Enrich DataFrame
             st.write("Enriching run data...") 
@@ -335,19 +483,25 @@ with col1:
                  st.warning("Column 'status' not found in run data. Cannot determine status names.")
                  runs_df['Status Name'] = 'Status N/A'
             runs_df['Job Name'] = runs_df['job_definition_id'].map(lambda x: job_map.get(x, {}).get('name', f"Unknown Job {x}"))
-            runs_df['Project ID'] = runs_df['job_definition_id'].map(lambda x: job_map.get(x, {}).get('project_id'))
-            runs_df['Environment ID'] = runs_df['job_definition_id'].map(lambda x: job_map.get(x, {}).get('environment_id'))
+            # Use direct project_id from API response
+            runs_df['Project ID'] = runs_df['project_id']
+            runs_df['Environment ID'] = runs_df['environment_id']
             runs_df['Project Name'] = runs_df['Project ID'].map(lambda x: project_map.get(x, f"Unknown Project {x}"))
             runs_df['Environment Name'] = runs_df['Environment ID'].map(lambda x: environment_map.get(x, f"Unknown Env {x}"))
 
             # 5. Select and Store Final DataFrame
             cols_to_keep = [
-                'id', 'Status Name', 'Job Name', 'Project Name', 'Environment Name',
-                'created_at', 'duration', 'job_definition_id', 'status', 
+                'id', 'Status Name', 'Job Name', 'Project Name', 'Project ID', 'Environment Name', 'Environment ID',
+                'created_at', 'duration', 'job_definition_id', 'status', 'started_at', 'finished_at',
                 'git_branch', 'git_sha'
             ]
             existing_cols = [col for col in cols_to_keep if col in runs_df.columns]
             final_df = runs_df[existing_cols].copy()
+            
+            # 6. Calculate Rolling 7-Day Averages and Flags
+            st.write("Calculating rolling 7-day averages...")
+            final_df = calculate_rolling_averages_and_flags(final_df)
+            
             # Sort by creation time descending for consistent display
             final_df = final_df.sort_values(by='created_at', ascending=False)
 
@@ -372,14 +526,23 @@ if not st.session_state.runs_df.empty:
         selected_projects = st.multiselect("Project", available_projects, default=available_projects)
         selected_environments = st.multiselect("Environment", available_environments, default=available_environments)
         selected_jobs = st.multiselect("Job Name", available_jobs, default=available_jobs)
+        
+        # Add filter for jobs exceeding average
+        show_exceeding_only = st.checkbox("Show only jobs exceeding 7d average", value=False)
 
     # Apply Filters
-    filtered_df = df[
+    filter_conditions = (
         df['Status Name'].isin(selected_statuses) &
         df['Project Name'].isin(selected_projects) &
         df['Environment Name'].isin(selected_environments) &
         df['Job Name'].isin(selected_jobs)
-    ].copy() 
+    )
+    
+    # Add exceeding average filter if enabled
+    if show_exceeding_only:
+        filter_conditions = filter_conditions & df['exceeds_average']
+    
+    filtered_df = df[filter_conditions].copy() 
 
     with col2: # Main display area
         st.write(f"**Range Summary ({start_date.isoformat()} to {end_date.isoformat()})**") # Update title
@@ -388,23 +551,117 @@ if not st.session_state.runs_df.empty:
         successful_runs = len(filtered_df[filtered_df['Status Name'] == 'Success'])
         failed_runs = len(filtered_df[filtered_df['Status Name'] == 'Error'])
         cancelled_runs = len(filtered_df[filtered_df['Status Name'] == 'Cancelled'])
+        exceeding_runs = len(filtered_df[filtered_df['exceeds_average'] == True])
         
         # Display Metrics in columns
-        metric_cols = st.columns(4)
+        metric_cols = st.columns(5)
         with metric_cols[0]: st.metric("Total Runs (Filtered)", total_runs_display)
         with metric_cols[1]: st.metric("Successful", successful_runs, delta_color="off") 
         with metric_cols[2]: st.metric("Failed/Errored", failed_runs, delta_color="inverse" if failed_runs > 0 else "off")
         with metric_cols[3]: st.metric("Cancelled", cancelled_runs, delta_color="off")
+        with metric_cols[4]: st.metric("Exceeding 7d Avg", exceeding_runs, delta_color="inverse" if exceeding_runs > 0 else "off")
         
         st.divider() 
         
         st.write(f"**Run Details ({len(filtered_df)} of {len(df)} runs shown after filtering)**")
-        # Define columns to display in the main table
-        display_cols = ['id', 'Status Name', 'Job Name', 'Project Name', 'Environment Name', 'created_at', 'duration']
-        # Ensure columns exist before trying to display them
-        display_cols_existing = [col for col in display_cols if col in filtered_df.columns]
-        st.dataframe(filtered_df[display_cols_existing], use_container_width=True, height=600)
         
+        # Display duration columns in their original format, no formatting  
+        display_df = filtered_df.copy()
+        display_df['⚠️ Exceeds Avg'] = display_df['exceeds_average'].apply(lambda x: "🔴 Yes" if x else "✅ No")
+        
+        
+        # Add URLs for clickable hyperlinks to dbt Cloud UI
+        def create_run_url(row):
+            run_id = row.get('id')
+            project_id = row.get('Project ID')
+            
+            if pd.notna(run_id) and pd.notna(project_id):
+                return f"{BASE_URL}/deploy/{ACCOUNT_ID}/projects/{project_id}/runs/{run_id}"
+            else:
+                return None
+ 
+        def create_job_url(row):
+            job_id = row.get('job_definition_id')
+            project_id = row.get('Project ID')
+            
+            if pd.notna(job_id) and pd.notna(project_id):
+                return f"{BASE_URL}/deploy/{ACCOUNT_ID}/projects/{project_id}/jobs/{job_id}"
+            else:
+                return None
+
+        # Create separate ID and URL columns for LinkColumn configuration
+        display_df['Run ID'] = display_df['id']
+        display_df['Run URL'] = display_df.apply(create_run_url, axis=1)
+        display_df['Job ID'] = display_df['job_definition_id'] 
+        display_df['Job URL'] = display_df.apply(create_job_url, axis=1)
+
+        # Define columns to display in the main table
+        display_cols = ['Run ID', 'Job ID', 'Status Name', 'Job Name', 'Project Name', 'Environment Name', 
+                       'created_at', 'run_duration_seconds', '7d_avg_duration', '⚠️ Exceeds Avg']
+        display_cols_existing = [col for col in display_cols if col in display_df.columns]
+ 
+        # For LinkColumn with display_text, we need the URL in the column value
+        # and the ID values in separate columns for display_text reference
+        display_df['Run ID'] = display_df.apply(
+            lambda row: row['Run URL'] if pd.notna(row['Run URL']) else str(row['id']), 
+            axis=1
+        )
+        display_df['Job ID'] = display_df.apply(
+            lambda row: row['Job URL'] if pd.notna(row['Job URL']) else str(row['job_definition_id']), 
+            axis=1
+        )
+        
+        # Add ID columns for display_text to reference
+        display_df['run_id_display'] = display_df['id'].astype(str)
+        display_df['job_id_display'] = display_df['job_definition_id'].astype(str)
+
+        # Configure columns with LinkColumn and display_text using regex substitution
+        column_config = {
+            'Run ID': st.column_config.LinkColumn(
+                "🔗 Run ID",
+                help="Click to view run in dbt Cloud",
+                width="small",
+                display_text=r"(\d+)$"  # Extract just the number at the end of URL
+            ),
+            'Job ID': st.column_config.LinkColumn(
+                "🔗 Job ID", 
+                help="Click to view job in dbt Cloud",
+                width="small", 
+                display_text=r"(\d+)$"  # Extract just the number at the end of URL
+            ),
+            'run_duration_seconds': st.column_config.NumberColumn(
+                "📏 Duration (sec)",
+                help="Run duration: completed jobs use actual finish time, in-progress jobs show elapsed time",
+                format="%.1f"
+            ),
+            '7d_avg_duration': st.column_config.NumberColumn(
+                "📊 7d Avg (sec)",
+                help="7-day rolling average duration",
+                format="%.1f"
+            )
+        }
+
+        st.dataframe(
+            display_df[display_cols_existing], 
+            use_container_width=True, 
+            height=600,
+            column_config=column_config
+        )
+
+        st.caption("💡 Click on Run ID or Job ID links to open them in dbt Cloud")
+
+        # Add summary for exceeding jobs
+        if not filtered_df.empty and 'exceeds_average' in filtered_df.columns:
+            exceeding_df = filtered_df[filtered_df['exceeds_average'] == True]
+            if not exceeding_df.empty:
+                st.write("**⚠️ Jobs Exceeding 7-Day Average**")
+                exceeding_summary = exceeding_df.groupby('Job Name').agg({
+                    'exceeds_average': 'count',
+                    '7d_avg_duration': 'first'
+                }).reset_index()
+                exceeding_summary.columns = ['Job Name', 'Exceeding Runs', '7d_avg_duration']
+                st.dataframe(exceeding_summary, use_container_width=True)
+
         st.write("**Run Status Summary (Filtered)**")
         if not filtered_df.empty:
             status_counts = filtered_df['Status Name'].value_counts().reset_index()
@@ -412,13 +669,3 @@ if not st.session_state.runs_df.empty:
             st.dataframe(status_counts, use_container_width=True)
         else:
              st.write("(No runs match current filters)")
-
-elif 'runs_df' in st.session_state and st.session_state.runs_df.empty:
-    # Handles the case where the button was clicked but no runs were found OR filters cleared everything
-    with col2:
-        st.info("No runs to display. Fetch runs for the selected date or adjust filters.")
-
-# No 'else' needed here, if runs_df isn't in session_state, nothing is displayed yet
-
-# --- Removed the old __main__ block ---
-# No longer needed as Streamlit runs the script from the top 
